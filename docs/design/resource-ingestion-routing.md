@@ -28,7 +28,14 @@ ResourceService._submit_resource_ingestion    阶段一：对新请求选择执�
         |
         +-- Git && wait=false ----------------> 预检 + AddResource 队列 --> 返回 task_id
         |
-        +-- HTTP 服务远程资源 && wait=false && Understanding 已启用
+        +-- wait=false && 可确定使用内置 Parser
+        |       |
+        |       +-- 本地文件 / 目录 ----------> 固化到 VikingFS 临时区
+        |       +-- URL ----------------------> 保留原 URL
+        |                                             |
+        |                                             +--> AddResource 队列 --> 返回 task_id
+        |
+        +-- wait=false && 需要先确定 Parser 后端
         |       |
         |       +-- 原始 URL 可直达 -----------> 提交 Understanding --> ExternalParse 队列
         |       |                                                        |
@@ -40,7 +47,7 @@ ResourceService._submit_resource_ingestion    阶段一：对新请求选择执�
         |               |                                             |
         |               |                                             +--> 返回 task_id --> Worker
         |               |
-        |               +-- 未命中 ------------> 复用 LocalResource，进入当前请求标准链
+        |               +-- 未命中 ------------> 固化 LocalResource --> AddResource 队列
         |
         +-- 其余场景（包括所有 wait=true） -----> _execute_resource_ingestion
 
@@ -78,7 +85,7 @@ UnifiedResourceProcessor
         |
         +-- wait=true  --> 继续等待摘要 / 语义队列 / 向量索引后返回
         |
-        +-- wait=false --> 普通标准链落盘后进入 AddResource 队列并返回
+        +-- wait=false --> 仅剩余请求内链路落盘后进入 AddResource 队列并返回
 
 后台队列 Worker
         |
@@ -95,7 +102,7 @@ WatchScheduler
                                                重新获取和解析来源，但不修改 Watch 任务
 ```
 
-Understanding 不受 `wait=false` 限制。`wait=true` 在当前请求内完成 Understanding 提交、轮询、解析和 TreeBuilder，并继续等待后续队列；`wait=false` 的远程服务路径会先提交 Understanding、将 `response_id` 入队，再由 Worker 恢复任务。
+Understanding 不受 `wait=false` 限制。`wait=true` 在当前请求内完成 Understanding 提交、轮询、解析和 TreeBuilder，并继续等待后续队列；`wait=false` 的 Understanding 路径会先提交、将 `response_id` 入队，再由 Worker 恢复任务。已确定使用内置 Parser 的来源直接进入 `AddResource`，下载和解析失败通过任务状态返回。
 
 分类发生的位置：
 
@@ -107,7 +114,7 @@ Understanding 不受 `wait=false` 限制。`wait=true` 在当前请求内完成 
 | Understanding 能否直接接收原始 URL | `ParserRouter.should_use_understanding_directly` | 直达 Understanding 或继续 Accessor |
 | Understanding 与内置 Parser | `ParserRouter.parse` | `ParseResult` |
 
-后台资源任务统一使用可恢复的 `AddResourceMsg`，但按工作类型进入两个独立队列：Understanding 使用受外部解析并发限制的 `ExternalParse`；Git 和已落盘的本地后处理使用 `AddResource`。两个队列都由 `AddResourceProcessor` 消费，锁接管失败时仍回到原队列。消息已经冻结了生产端做出的选择，例如 `parser_backend`、`understanding_response_id` 和 `resolved_extension`。Worker 直接执行该选择，不再把任务送回公开 `add_resource` 重新分类。
+后台资源任务统一使用可恢复的 `AddResourceMsg`，但按工作类型进入两个独立队列：Understanding 使用受外部解析并发限制的 `ExternalParse`；Git、内置 Parser 来源和已落盘的本地后处理使用 `AddResource`。两个队列都由 `AddResourceProcessor` 消费，锁接管失败时仍回到原队列。消息已经冻结了生产端做出的选择，例如 `parser_backend`、`understanding_response_id` 和 `resolved_extension`。Worker 直接执行该选择，不再把任务送回公开 `add_resource` 重新分类。
 
 ## 顶层路由表
 
@@ -118,9 +125,9 @@ Understanding 不受 `wait=false` 限制。`wait=true` 在当前请求内完成 
 | Git 未命中 Connector 或无凭证回退，`wait=false` | GitAccessor 在后台 clone | 内置目录/代码仓库 Parser | 是 | 预检仓库并预占 URI 后返回 |
 | Git，`wait=true` | GitAccessor | 内置目录/代码仓库 Parser | 是 | 解析、落盘及语义队列完成后返回 |
 | 飞书 URL，`parser_api.enable_feishu_url=true` 且有 user/app 凭证 | Understanding 直接读取飞书 | Understanding | 是 | `wait=false` 时提交并入队；`wait=true` 时同步解析 |
-| 飞书 URL，直达配置关闭或无可用凭证 | FeishuAccessor | 内置 Markdown Parser | 是 | Accessor 拉取、归一化后走标准链 |
+| 飞书 URL，直达配置关闭或无可用凭证 | FeishuAccessor | 内置 Markdown Parser | 是 | `wait=false` 时原 URL 入队，由 Worker 拉取、归一化 |
 | HTTP 服务请求，`wait=false`，命中 Understanding | HTTPAccessor 识别类型并上传同一份本地文件 | Understanding | 是 | 类型识别、Understanding 提交、URI 预占和入队后返回 |
-| 其他 URL、文件、目录、原始文本 | 对应 Accessor；原始文本无需 Accessor | 内置 Parser 或同步 Understanding | 是 | 至少完成解析和落盘后返回 |
+| 其他 URL、文件、目录、原始文本 | 对应 Accessor；原始文本无需 Accessor | 内置 Parser 或同步 Understanding | 是 | `wait=false` 的文件、目录和已知内置 Parser URL 在后台处理；原始文本仍在请求内解析 |
 
 Git 是 Connector 与标准链共享的来源：未命中 Connector 或参数不受支持时可回退到标准链；一旦请求带有 Connector 专用凭证则禁止回退，避免凭证进入持久化队列。`tos://` 没有标准 Accessor，不能回退，否则只会在更深处得到误导性的解析错误。
 
@@ -169,6 +176,8 @@ ParserRouter --> MarkdownParser --> ParseResult --> TreeBuilder
 | `wiki/{token}` | 先解析 wiki 节点的实际类型和 token，再进入上述 `docx`、`sheets` 或 `base` 处理器 | wiki 指向其他飞书对象类型时明确报不支持 |
 
 四类入口都支持应用凭证获取的 tenant token；显式传入 `args.feishu_access_token` 时，同一 user token 会用于本次选中的飞书链路。Accessor 路径中，它用于 wiki 解析、正文、sheet/base 和图片请求；Understanding 直达路径中，它作为 `lark_file.user_access_token` 提交，随后从后台队列参数中删除。
+
+`wait=false` 的 FeishuAccessor 任务把一次性 user token 放在已有 TaskRecord 的私有输入中，不写入 QueueFS，也不通过 task info/list 返回；来源处理成功或失败后该字段会被清空。
 
 飞书专有的本地归一化逻辑到 `FeishuAccessor` 为止，后面只处理 Markdown，因此不再保留并行的本地 `FeishuParser` 入口。即使 `parser_api.extensions` 包含 `md`，`SourceType.FEISHU` 的 `LocalResource` 也固定使用内置 Markdown Parser，不会把已经拉取的数据再次送 Understanding。传给 Understanding 的本地文件同样优先上传本地内容，`original_source` 只作为来源元数据，不会导致二次抓取原 URL。
 
@@ -270,13 +279,14 @@ Connector 当前要求提供精确 `to`，不接受 `parent`；也不支持 `wai
 | Git | 预检并预占 URI 后启动后台标准链 | 当前请求内完成标准链并等待队列 |
 | 飞书直达 Understanding | 生产端提交后只将 response ID 放入 `ExternalParse`；无显式资源名时可延迟返回 `root_uri` | 当前请求内调用 Understanding，再等待后续队列 |
 | HTTP 服务 + 异步 Understanding | 先识别类型，再预占 URI、入 `ExternalParse` 后返回 | 当前请求内调用 Understanding，再等待后续队列 |
-| 普通标准链 | 解析和落盘完成后返回；摘要/语义处理由任务监控 | 解析和落盘完成后继续等待语义队列 |
+| 本地文件、目录、已知内置 Parser URL | 本地来源先固化，URL 保留原地址；预占目录 URI 并入 `AddResource` 后返回 | 解析和落盘完成后继续等待语义队列 |
+| 原始文本等剩余标准链 | 解析和落盘完成后返回；摘要/语义处理由任务监控 | 解析和落盘完成后继续等待语义队列 |
 
-所以普通 `wait=false` 不是“所有工作后台化”，而是“资源树已落盘，但不阻塞等待后续语义任务”。Git 与异步 Understanding 是两个明确的例外分支。
+所以 `wait=false` 会把可持久化的来源处理放进后台任务，但不会为原始文本、带请求内凭证的 Git 等链路额外复制一套机制。
 
 ## 目标 URI、锁和失败边界
 
-- 需要后台执行的 Git 与普通文件 Understanding 任务会先规划并预占目标 URI，避免返回的 URI 随后台竞态变化。未指定名称的飞书直达任务会延迟目标 URI 解析，以 artifact 的真实根标题作为最终名称，并在完成时回写 TaskRecord。
+- 后台 Git、内置 Parser 和普通文件 Understanding 任务会先规划并预占目标 URI，避免返回的 URI 随后台竞态变化。内置 Parser 任务立即返回的 `root_uri` 是目标目录，即使最终只有一个文件。未指定名称的飞书直达任务会延迟目标 URI 解析，以 artifact 的真实根标题作为最终名称，并在完成时回写 TaskRecord。
 - 锁通过 handoff 交给后台任务或队列 Worker；入队失败时立即释放，并把任务标为失败。
 - 临时 `LocalResource` 由拥有它的调用层清理；交给标准处理器后，清理责任随之转移。
 - Parser 产生 `ParseResult` 后才进入 TreeBuilder。没有临时解析产物时标准链返回解析错误；目录允许带 warnings 的部分成功，`strict` 决定是否暴露这些警告。
@@ -306,5 +316,5 @@ Connector 当前要求提供精确 `to`，不接受 `parent`；也不支持 `wai
 - 已归一化飞书 Markdown：无论 `extensions` 是否包含 `md`，都走内置 Markdown Parser。
 - Understanding 返回结果：先转成 `ParseResult`，仍由本地 TreeBuilder 落盘。
 - Connector 返回结果：只返回任务标识，不经过本地 `ParseResult`。
-- 普通 Markdown 且 `wait=false`：返回前 Markdown 已解析并落盘，只是不等待后续语义队列。
+- 普通 Markdown 文件且 `wait=false`：先固化来源并返回，解析和落盘由 `AddResource` 任务完成。
 - 网站抓取出的目录：进入 DirectoryParser，页面子文件不会逐个调用 Understanding。

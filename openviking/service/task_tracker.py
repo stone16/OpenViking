@@ -80,6 +80,7 @@ class TaskRecord:
     stage: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    private_input: Dict[str, Any] = field(default_factory=dict, repr=False)
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize for JSON response."""
@@ -89,6 +90,7 @@ class TaskRecord:
         d["updated_at_iso"] = datetime.fromtimestamp(self.updated_at, tz=timezone.utc).isoformat()
         d["result"] = _sanitize_task_result(d.get("result"))
         d["meta"] = _sanitize_task_result(d.get("meta"))
+        d.pop("private_input", None)
         d.pop("account_id", None)
         d.pop("user_id", None)
         return d
@@ -353,6 +355,7 @@ class TaskTracker:
         user_id: str,
         task_id: Optional[str] = None,
         meta: Optional[Dict[str, Any]] = None,
+        private_input: Optional[Dict[str, Any]] = None,
     ) -> TaskRecord:
         """Register a new pending task. Returns a snapshot copy."""
         self._validate_owner(account_id, user_id)
@@ -363,6 +366,7 @@ class TaskTracker:
             account_id=account_id,
             user_id=user_id,
             meta=dict(meta or {}),
+            private_input=dict(private_input or {}),
         )
         return await self._dispatcher.run(lambda: self._create_on_owner(task, task_id is not None))
 
@@ -587,6 +591,7 @@ class TaskTracker:
                 if work_error and updated.error is None:
                     updated.error = _sanitize_error(work_error)
                 updated.updated_at = self._next_updated_at(task)
+                updated.private_input = {}
                 try:
                     await self._persist_and_publish("update", updated)
                 except _CommittedMutationCancelled as exc:
@@ -713,6 +718,7 @@ class TaskTracker:
                     return
                 updated.stage = updated.status.value
                 updated.updated_at = self._next_updated_at(task)
+                updated.private_input = {}
                 await self._persist_and_publish("update", updated)
                 self._work_index.clear_failure(task_id)
                 logger.info("[TaskTracker] Task %s %s", task_id, updated.status.value)
@@ -739,6 +745,27 @@ class TaskTracker:
         if timeout is None:
             return await _poll()
         return await asyncio.wait_for(_poll(), timeout)
+
+    async def get_private_input(
+        self,
+        task_id: str,
+        *,
+        account_id: str,
+        user_id: str,
+    ) -> Dict[str, Any]:
+        """Load task-owned input that is excluded from public task snapshots."""
+
+        async def load() -> Dict[str, Any]:
+            task = self._cached_task(task_id)
+            if task is None:
+                task = await self._load_from_store(task_id, account_id, user_id)
+                if task is not None:
+                    self._publish_task(task)
+            if task is None or not self._matches_owner(task, account_id, user_id):
+                return {}
+            return deepcopy(task.private_input)
+
+        return await self._dispatcher.run(load)
 
     async def delete_user_tasks(self, account_id: str, user_id: str) -> int:
         """Delete terminal task records for one user from storage and cache."""
@@ -1021,6 +1048,7 @@ class TaskTracker:
         copied = deepcopy(task)
         copied.meta = _sanitize_task_result(copied.meta)
         copied.result = _sanitize_task_result(copied.result)
+        copied.private_input = {}
         return copied
 
     def count(self) -> int:

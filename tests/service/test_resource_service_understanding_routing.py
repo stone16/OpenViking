@@ -53,6 +53,7 @@ async def test_extensionless_remote_url_queues_frozen_understanding_route(
     processor = SimpleNamespace(
         understanding_api_enabled=lambda: True,
         should_use_understanding_directly=lambda _source, **_kwargs: False,
+        async_route_requires_preparation=lambda _source, **_kwargs: True,
         prepare_resource=AsyncMock(return_value=prepared),
         should_use_understanding_api=lambda resource: resource is prepared,
         submit_understanding=AsyncMock(return_value="response-1"),
@@ -155,13 +156,12 @@ async def test_remote_mpeg_ts_url_queues_understanding_after_prepare(
     processor = SimpleNamespace(
         understanding_api_enabled=lambda: True,
         should_use_understanding_directly=lambda _source, **_kwargs: False,
+        async_route_requires_preparation=lambda _source, **_kwargs: True,
         prepare_resource=AsyncMock(return_value=prepared),
         should_use_understanding_api=lambda resource: resource is prepared,
         submit_understanding=AsyncMock(return_value="response-1"),
         tree_builder=SimpleNamespace(resolve_target_uri=resolve_target_uri),
-        reserve_unique_candidate=AsyncMock(
-            return_value=("viking://resources/video/sample", lock)
-        ),
+        reserve_unique_candidate=AsyncMock(return_value=("viking://resources/video/sample", lock)),
         process_resource=AsyncMock(),
     )
     service = ResourceService(
@@ -170,7 +170,7 @@ async def test_remote_mpeg_ts_url_queues_understanding_after_prepare(
         resource_processor=processor,
         skill_processor=object(),
     )
-    service._should_use_connector = lambda *_args, **_kwargs: False
+    service._connector_delegate = SimpleNamespace(should_delegate=lambda *_args, **_kwargs: False)
     tracker = SimpleNamespace(
         create=AsyncMock(return_value=SimpleNamespace(task_id="task-1")),
         update_stage=AsyncMock(),

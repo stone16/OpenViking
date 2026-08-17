@@ -93,11 +93,11 @@ URL/文件  Parser  TreeBuilder  AGFS    Summarizer/Vector
 - **向量索引**：将内容向量化用于语义搜索
 - 通过 `SemanticQueue` 异步处理，可通过 `wait=True` 等待完成
 
-#### 非等待 Git 仓库导入
+#### 非等待资源导入
 - 对 Git 仓库来源使用 `wait=false` 时，OpenViking 会先校验仓库、解析目标 URI、预占最终 `root_uri`，然后在 clone/parse/finalize 完成前返回。
-- 立即响应包含 `status`、`root_uri` 和 `task_id`；抓取、解析、finalize 以及队列等待会在持久化后台任务中继续执行。
-- 可通过 `GET /api/v1/tasks/{task_id}` 查询任务状态。Git 资源导入任务的阶段包括 `queued`、`fetching`、`parsing`、`finalizing`、`processing_queue`。
-- 其他资源来源使用 `wait=false` 时，会在响应前完成抓取/解析/finalize；返回的 `task_id` 只用于跟踪 semantic 和 embedding 队列完成情况。
+- 本地文件或目录会先复制到任务自己的临时存储再返回。能够直接确定使用内置 Parser 的 URL 不在请求内下载，下载、解析、finalize 和后续队列工作都由持久化任务执行。
+- 如果仅凭 URL 还不能确定使用内置 Parser 还是 Understanding，请求仍可能先获取一次来源。命中 Understanding 时只把 response ID 入队；否则把已获取的来源快照入队。
+- 立即响应包含 `status`、预占的目标目录 `root_uri` 和 `task_id`。可通过 `GET /api/v1/tasks/{task_id}` 查看下载/来源错误和最终结果。
 
 ### 资源的增量更新
 
@@ -184,23 +184,23 @@ URL/文件  Parser  TreeBuilder  AGFS    Summarizer/Vector
 - `user_id` 和 `peer_id` 路径片段必须是安全的单段标识，例如 `alice` 或 `web-visitor-alice`。包含路径分隔符、`.`、`..`、`:` 或 `+` 的值会被拒绝。
 - `path` 和 `temp_file_id` 不能同时指定，上传本地文件需要先通过 [temp_upload](#temp_upload) 上传获取 `temp_file_id`，在 SDK 和 CLI 中已经封装好。
 - `tags` 会在资源解析后、向量记录写入时同步写入底层向量库。`add_resource(tags=...)` 不返回 `tags_result`；需要验证时，可在 `/api/v1/search/find` 或 `/api/v1/search/search` 中传相同 `tags` 过滤召回。
-- 只有 Git 仓库来源在 `wait=false` 时使用完整后台导入；OpenViking 会先完成仓库 preflight 和目标规划，再返回 `task_id`。
 - 原生 HTTPS Git 的 `args.auth_config` 在 `watch_interval <= 0` 时只用于本次请求；当 `watch_interval > 0` 时，OpenViking 会把与仓库 URL 绑定的 username/token 保存到 Watch 私有鉴权状态，并只在后续 Git 拉取时恢复使用。凭据不会进入普通持久队列，也不会出现在 Watch API/MCP/CLI 返回中。Git PAT 没有通用刷新流程，过期或撤销后需要重建 Watch 来更换 token。为兼容已有用法，系统仍接受 `https://user:token@host/repo.git` 形式的 URL 内嵌凭据并原样传递；由于该 URL 同时也是资源来源标识，它可能被记录到进程参数、日志、队列、资源元数据和 Watch 状态中。新接入建议使用 `args.auth_config`。`args.auth_config` 的明文 HTTP 鉴权和带鉴权重定向仍会被拒绝。
 - token 会放在 HTTPS 请求体中传输。生产环境应保持诊断请求体 dump 关闭；显式启用该功能可能记录秘密。
 - `reason` 触发的记忆生成复用 `session.commit` 的抽取链路，只使用 `reason`、资源 URI、可用的资源名称和目录摘要，不会读取或展开完整资源正文；系统会写入 `entities`、`events`、`preferences` 等已有记忆类型，不创建独立的资源记忆目录。
 - 删除资源时，系统会在删除前扫描本次上下文对应的 self 或 peer 记忆中的 `resource_refs`，清理对应资源 URI 和由该 `reason` 引入的内容，并重新刷新相关记忆的语义索引。
-- 其他来源在 `wait=false` 时会在响应前完成来源解析、目标解析和 AGFS 写入，仅 semantic 与 embedding 队列继续异步处理。
+- Git 仓库、本地文件或目录，以及已知使用内置 Parser 的 URL，在 `wait=false` 时都会执行完整后台导入。原始文本和带凭证的 Git 回退链路仍可能在请求内完成来源处理，只把后续队列工作异步化。
 - `processing_mode=vectors_only` 不调用 VLM 语义理解阶段，也不会生成或刷新 `.abstract.md` / `.overview.md`。对已存在目标，它会保留旧的语义产物和旧的语义向量；仍会更新资源树，在 `build_index=true` 时向量化当前非隐藏文件，并清理由本次刷新删除的文件 detail 向量。
 - `processing_mode` 只属于 `add_resource`。管理员维护已有数据时，`reindex` API/CLI 仍使用 `mode`（`vectors_only`、`semantic_and_vectors`、`prune_orphans`）。
 - `watch_interval > 0` 时，如果指定了 `to`，监控任务绑定该目标；如果未指定 `to`，监控任务绑定本次导入返回的 `root_uri`。如果无法得到稳定 `root_uri`，请求会报错并要求显式传 `to`。
 - 飞书/Lark 应用 token 导入不传 `args.feishu_access_token`。OpenViking 保持原有应用凭证流程，由 SDK 使用 `app_id` 和 `app_secret` 自动获取 app/tenant token。该模式支持一次性导入和 `watch_interval > 0`。
-- 飞书/Lark 一次性用户 token 导入通过 `args={"feishu_access_token": "u-..."}` 传入，且 `watch_interval <= 0`。OpenViking 只在本次导入使用该用户 token，不保存。
+- 飞书/Lark 一次性用户 token 导入通过 `args={"feishu_access_token": "u-..."}` 传入，且 `watch_interval <= 0`。后台内置 Parser 任务只把 token 放在任务私有输入中，不写入 QueueFS 或任务 API，并在来源处理成功或失败后删除。
 - 飞书/Lark 用户 token watch 通过 `args={"feishu_access_token": "u-...", "feishu_refresh_token": "r-..."}` 传入，且 `watch_interval > 0`。OpenViking 会把 token 状态保存在 watch task 私有状态里，用配置的飞书应用凭证刷新，并在后续 watch 重跑中使用刷新后的用户 token。
 - 飞书/Lark 用户 token watch 需要 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET`，或 `ov.conf` 中的 `feishu.app_id` 和 `feishu.app_secret`。飞书 refresh token 绑定签发它的应用，因此传入的用户 token 必须来自 OpenViking 当前配置的同一个飞书应用。
 - Watch task 的 token 状态保存在内部控制文件 `viking://resources/.watch_tasks.json` 中，不会出现在 watch API/MCP/CLI 返回里。若启用了 VikingFS 文件加密，该控制文件会静态加密；否则服务端控制文件中会包含明文 token 状态。
 - 本地目录输入会遵循 `.gitignore`（根目录和子目录，标准 Git 语义）；`ignore_dirs`、`include`、`exclude` 会在此基础上进一步过滤。
 - `args.parse_mode=no_split` 仍调用正常的格式 Parser。PDF、Word、PowerPoint、HTML 等受支持文档会转换为 Markdown，但跳过按标题、段落和长度拆分。目录导入会对每个受支持文档分别应用该规则，并继续遵循 `.gitignore`、筛选参数和 `preserve_structure`。
 - 对单文件输入使用 `no_split` 时，如果解析结果恰好只有一个可见文件且未指定 `to`，该文件会直接放到解析出的父目录下（例如 `guide.md` 写入 `viking://resources/guide.md`），不会创建同名上层目录，也不会生成目录级 `.abstract.md` / `.overview.md`。如果解析结果还包含图片等其他可见文件，则保留上层目录。显式指定的 `to` 始终作为最终 URI 原样保留。
+- `wait=false` 的后台内置解析会立即返回预占的目标目录 `root_uri`，即使最终解析结果只有一个文件。
 - `no_split` 只改变 Markdown 正文的存储布局，不改变语义处理、文件向量化和内部 embedding 分块。Markdown 相对链接会按同一个 no-split 输出布局解析，不会再指向仅拆分模式存在的路径。如果配置的 Understanding 解析器无法保证单一 Markdown 正文，接口会明确返回不支持该模式的错误。
 - 如果要直接创建或更新纯文本内容，请使用 [content/write](03-filesystem.md#write)，不要使用 `add_resource`。资源导入和内容写入后都会自动刷新语义与 embedding。
 
@@ -535,16 +535,13 @@ ov add-resource ./documents/guide.md -p viking://resources/docs/{calendar:today}
   "result": {
     "status": "success",
     "root_uri": "viking://resources/guide",
-    "temp_uri": "viking://temp/username/04291108_b62dc7/guide",
-    "source_path": "./documents/guide.md",
-    "meta": {},
-    "errors": [],
+    "source_path": "https://example.com/guide.md",
     "task_id": "uuid-xxx"
   }
 }
 ```
 
-使用返回的 `task_id` 轮询 `/api/v1/tasks/{task_id}` 可查看队列完成情况。对于 `wait=false` 的 Git 仓库来源，同一个端点会跟踪完整后台导入，任务完成后的 `result` 会包含完整导入结果，包括 `queue_status`。
+使用返回的 `task_id` 轮询 `/api/v1/tasks/{task_id}` 可跟踪完整后台导入和后续队列。任务完成后的 `result` 会包含最终导入结果和 `queue_status`。
 
 **CLI 响应 (默认表格格式)**
 
@@ -571,8 +568,8 @@ task_id      uuid-xxx
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `status` | string | 处理状态："success" 成功，"error" 失败 |
-| `root_uri` | string | 资源在 OpenViking 中的最终 URI |
-| `task_id` | string | （可选，仅当 `wait=false` 时）可轮询 `/api/v1/tasks/{task_id}` 的任务 ID。非 Git 导入用于队列跟踪；Git 仓库导入用于完整后台导入跟踪。 |
+| `root_uri` | string | 资源 URI；非等待后台导入时为预占的目标目录 |
+| `task_id` | string | （可选，仅当 `wait=false` 时）可轮询 `/api/v1/tasks/{task_id}`，跟踪来源处理和后续队列工作 |
 | `temp_uri` | string | 导入过程中生成的临时 URI |
 | `source_path` | string | 原始源文件路径或 URL |
 | `meta` | object | 资源解析过程中的元数据（如文件类型、大小等） |
@@ -581,7 +578,7 @@ task_id      uuid-xxx
 | `queue_status` | object | （可选，仅当 `wait=true` 时）队列处理状态，包含 `pending`、`processing`、`completed` 计数 |
 | `memory_linking` | object | （可选，仅当 `reason` 触发记忆生成时）本次资源 URI 与用户记忆的关联结果 |
 
-对于 `wait=false` 的 Git 仓库来源，后台任务的 `task_type="add_resource"`，`resource_id` 等于返回的 `root_uri`。运行中的任务记录可能包含 `stage`；完成后的任务 `result` 会包含带有 semantic 和 embedding 汇总的 `queue_status`。
+后台来源导入任务的 `task_type="add_resource"`，`resource_id` 等于返回的 `root_uri`。运行中的任务记录可能包含 `stage`；完成后的任务 `result` 会包含带有 semantic 和 embedding 汇总的 `queue_status`。
 
 ---
 

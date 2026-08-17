@@ -125,6 +125,9 @@ class ResourceProcessor:
     def should_use_understanding_directly(self, source: str, **kwargs) -> bool:
         return self._get_media_processor().should_use_understanding_directly(source, **kwargs)
 
+    def async_route_requires_preparation(self, source: str, **kwargs) -> bool:
+        return self._get_media_processor().async_route_requires_preparation(source, **kwargs)
+
     async def submit_understanding(self, source: Union[str, "LocalResource"], **kwargs) -> str:
         return await self._get_media_processor().submit_understanding(source, **kwargs)
 

@@ -501,6 +501,7 @@ async def test_persistent_store_writes_task_record_json():
     task = await tracker.create(
         "add_resource",
         resource_id="viking://resources/demo",
+        private_input={"feishu_access_token": "u-test"},
         **_owner_kwargs(),
     )
 
@@ -512,6 +513,15 @@ async def test_persistent_store_writes_task_record_json():
     assert payload["account_id"] == "acme"
     assert payload["user_id"] == "alice"
     assert payload["stage"] is None
+    assert payload["private_input"] == {"feishu_access_token": "u-test"}
+    assert "private_input" not in task.to_dict()
+    assert await tracker.get_private_input(task.task_id, **_owner_kwargs()) == {
+        "feishu_access_token": "u-test"
+    }
+
+    await tracker.complete(task.task_id, {"root_uri": "viking://resources/demo"})
+    raw = agfs.files[f"/local/acme/_system/tasks/alice/{task.task_id}.json"]
+    assert json.loads(raw.decode("utf-8"))["private_input"] == {}
     assert "schema_version" not in payload
 
 

@@ -106,10 +106,11 @@ async def test_no_split_is_forwarded_and_persisted_for_watch_replay(
 
 
 @pytest.mark.asyncio
-async def test_no_split_watch_replay_preserves_auto_bound_file_target(
+async def test_no_split_watch_replay_preserves_auto_bound_directory_target(
     service: ResourceService,
     ctx: RequestContext,
 ):
+    service._plan_resource_target = AsyncMock(return_value=("viking://resources/test", None))
     watch_manager = WatchManager(viking_fs=None)
     await watch_manager.initialize()
     scheduler = WatchScheduler(resource_service=service, check_interval=1)
@@ -131,21 +132,23 @@ async def test_no_split_watch_replay_preserves_auto_bound_file_target(
     assert len(tasks) == 1
     task = tasks[0]
     assert task.to_uri == "viking://resources/test"
-    assert task.to_is_directory is False
+    assert task.to_is_directory is True
+    assert service._resource_processor.calls == []
     task = WatchTask.from_dict(task.to_storage_dict())
 
     await scheduler._execute_task(task)
 
     processor = service._resource_processor
     assert processor.calls[-1]["to"] == "viking://resources/test"
-    assert processor.calls[-1]["to_is_directory"] is False
+    assert processor.calls[-1]["to_is_directory"] is True
 
 
 @pytest.mark.asyncio
-async def test_no_split_watch_persists_auto_bound_multi_artifact_directory(
+async def test_no_split_watch_target_does_not_depend_on_artifact_count(
     service: ResourceService,
     ctx: RequestContext,
 ):
+    service._plan_resource_target = AsyncMock(return_value=("viking://resources/test", None))
     service._resource_processor.root_is_file = False
     watch_manager = WatchManager(viking_fs=None)
     await watch_manager.initialize()
@@ -165,6 +168,7 @@ async def test_no_split_watch_persists_auto_bound_multi_artifact_directory(
     )
     assert len(tasks) == 1
     assert tasks[0].to_is_directory is True
+    assert service._resource_processor.calls == []
 
 
 @pytest.mark.asyncio
@@ -259,6 +263,7 @@ async def test_no_split_bypasses_understanding_shortcut(
         direct_probe,
         raising=False,
     )
+    service._plan_resource_target = AsyncMock(return_value=("viking://resources/manual", None))
     monkeypatch.setattr(
         service._resource_processor,
         "understanding_api_enabled",
@@ -276,6 +281,10 @@ async def test_no_split_bypasses_understanding_shortcut(
 
     direct_probe.assert_not_called()
     api_probe.assert_not_called()
+    message = service._enqueue_add_resource_job.await_args.args[0]
+    assert message.root_uri == "viking://resources/manual"
+    assert message.parse_mode == "no_split"
+    assert message.args["parser_backend"] == "internal"
 
 
 @pytest.mark.asyncio
@@ -286,12 +295,8 @@ async def test_native_git_enqueue_persists_internal_no_split_mode(
     service._preflight_git_source = AsyncMock(
         return_value=SimpleNamespace(source_name="repo", source_path=None)
     )
-    service._plan_resource_target = AsyncMock(
-        return_value=("viking://resources/repo", None)
-    )
-    service._enqueue_add_resource_job = AsyncMock(
-        return_value=SimpleNamespace(task_id="task-git")
-    )
+    service._plan_resource_target = AsyncMock(return_value=("viking://resources/repo", None))
+    service._enqueue_add_resource_job = AsyncMock(return_value=SimpleNamespace(task_id="task-git"))
 
     result = await service.enqueue_git_add_resource(
         path="https://github.com/volcengine/OpenViking.git",

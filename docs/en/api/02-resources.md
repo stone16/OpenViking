@@ -100,11 +100,11 @@ Source Input -> Parse -> Resource Tree Build -> Persistence -> Semantic Processi
 - **Vector Index**: Vectorizes content for semantic search
 - Processed asynchronously via `SemanticQueue`, can wait for completion with `wait=True`
 
-#### Non-Wait Git Repository Imports
+#### Non-Wait Resource Imports
 - For Git repository sources with `wait=false`, OpenViking validates the repository, resolves the target URI, reserves the final `root_uri`, and returns before clone/parse/finalize completes.
-- The immediate response contains `status`, `root_uri`, and `task_id`; fetching, parsing, finalizing, and queue waiting continue in a persistent background task.
-- Poll `GET /api/v1/tasks/{task_id}` to inspect task state. Git resource import tasks use stages such as `queued`, `fetching`, `parsing`, `finalizing`, and `processing_queue`.
-- Other resource sources with `wait=false` finish fetching/parsing/finalizing before the response; their returned `task_id` tracks semantic and embedding queue completion only.
+- Local files/directories are copied into task-owned temporary storage before returning. URLs that are known to use the built-in parser are queued without downloading in the request; download, parsing, finalizing, and subsequent queue work run in the persistent task.
+- A remote URL whose parser backend cannot be chosen from the URL alone may still be fetched before returning. If it is routed to Understanding, the request submits it and queues only the response ID; otherwise the fetched source is queued as a durable snapshot.
+- The immediate response contains `status`, the reserved target-directory `root_uri`, and `task_id`. Poll `GET /api/v1/tasks/{task_id}` for source/download failures and final results.
 
 ### Incremental Updates for Resources
 
@@ -190,23 +190,24 @@ This endpoint is the core entry point for resource management, supporting adding
 - `path` and `temp_file_id` cannot be specified together
 - Raw HTTP calls for local files require first uploading via [temp_upload](#temp_upload) to obtain `temp_file_id`
 - When `to` is specified and the target already exists, triggers incremental update
-- Only Git repository sources use full background import when `wait=false`; OpenViking performs repository preflight and target planning before returning the `task_id`.
+- Git repositories, local files/directories, and URLs with a known built-in-parser route use full background import when `wait=false`.
 - Native HTTPS Git credentials in `args.auth_config` remain request-local when `watch_interval <= 0`. When `watch_interval > 0`, OpenViking stores the repository-bound username/token in private watch state and restores it only for later Git fetches. The credentials are excluded from ordinary queue payloads and watch API/MCP/CLI responses. Git PATs have no generic refresh flow; rotate an expired or revoked token by recreating the watch. Legacy URL-embedded credentials such as `https://user:token@host/repo.git` remain accepted and are passed through unchanged; because that URL is also the source identifier, it may be recorded in process arguments, logs, queues, resource metadata, and watch state. Prefer `args.auth_config` for new integrations. Plaintext HTTP authentication and authenticated redirects for `args.auth_config` remain rejected.
 - The token travels in the HTTPS request body. Keep diagnostic request-body dumping disabled in production because explicitly enabling it can record secrets.
 - Memory generated from `reason` is extracted through the same pipeline as `session.commit`. It uses `reason`, the resource URI, available source name, and available directory abstract; it does not inspect or expand the full resource content. OpenViking writes to existing memory types such as `entities`, `events`, or `preferences`, not a dedicated resource memory directory.
 - When deleting a resource, OpenViking scans the self or peer memories targeted by the current context before deletion, removes the matching resource URI and content introduced by that `reason`, and refreshes the semantic index for the affected memories.
-- Other sources with `wait=false` finish source parsing, target resolution, and AGFS writes before returning. Only semantic and embedding queues continue asynchronously.
+- Raw text and credential-bearing Git fallback paths may still finish source processing in the request before only the remaining queue work continues asynchronously.
 - `processing_mode=vectors_only` does not call the VLM semantic-understanding stage and does not generate or refresh `.abstract.md` / `.overview.md`. For existing targets, it preserves existing semantic artifacts and existing semantic vectors. It still updates the resource tree, vectorizes current non-hidden files when `build_index=true`, and removes detail vectors for files deleted during refresh.
 - `processing_mode` belongs to `add_resource`. The admin `reindex` API/CLI continues to use `mode` (`vectors_only`, `semantic_and_vectors`, `prune_orphans`) for maintenance operations on already-ingested data.
 - When `watch_interval > 0`, the watch task binds to `to` if provided; otherwise it binds to the `root_uri` returned by this import. If no stable `root_uri` is available, the request fails and asks for an explicit `to`.
 - Feishu/Lark app-token imports do not pass `args.feishu_access_token`. OpenViking keeps the existing app credential flow and the SDK obtains an app/tenant token from `app_id` and `app_secret`. This mode supports both one-time imports and `watch_interval > 0`.
-- Feishu/Lark one-time user-token imports pass `args={"feishu_access_token": "u-..."}` with `watch_interval <= 0`. OpenViking uses that user token only for the current import and does not store it.
+- Feishu/Lark one-time user-token imports pass `args={"feishu_access_token": "u-..."}` with `watch_interval <= 0`. For a background built-in-parser task, OpenViking stores it only in the task's private input, excludes it from QueueFS and task APIs, and deletes it when source processing succeeds or fails.
 - Feishu/Lark user-token watches pass `args={"feishu_access_token": "u-...", "feishu_refresh_token": "r-..."}` with `watch_interval > 0`. OpenViking stores the token state in the private watch task state, refreshes it with the configured Feishu app credentials, and uses the refreshed user token for later watch runs.
 - Feishu/Lark user-token watches require `FEISHU_APP_ID` and `FEISHU_APP_SECRET` (or `feishu.app_id` and `feishu.app_secret` in `ov.conf`) because Feishu refresh tokens are bound to the app that issued them. The supplied user token must come from the same Feishu app configured in OpenViking.
 - Watch task token state is stored in the internal `viking://resources/.watch_tasks.json` control file and is hidden from watch API/MCP/CLI responses. If VikingFS file encryption is enabled, this control file is encrypted at rest; otherwise the server-side control file contains plaintext token state.
 - For local directory inputs, scanning respects `.gitignore` files (root and nested) with standard Git semantics; `ignore_dirs`, `include`, and `exclude` further refine what is ingested.
 - `args.parse_mode=no_split` still invokes the normal format Parser. PDF, Word, PowerPoint, HTML, and other supported documents are converted to Markdown, but heading-, paragraph-, and size-based splitting is skipped. A directory import applies this independently to each supported document and continues to honor `.gitignore`, filters, and `preserve_structure`.
 - For a single-file input in `no_split` mode, when parsing produces exactly one visible file and `to` is omitted, that file is stored directly under the resolved parent (for example, `guide.md` becomes `viking://resources/guide.md`). No wrapper directory or directory-level `.abstract.md` / `.overview.md` is created. If parsing also produces images or other visible files, the wrapper directory is retained. An explicit `to` is always preserved as the exact final URI.
+- With `wait=false` background built-in parsing, the immediate `root_uri` is the reserved target directory even when the eventual parse output contains one file.
 - `no_split` changes only the stored Markdown layout. Semantic processing, file vectorization, and any internal embedding chunking remain unchanged. Relative Markdown links are resolved against the same no-split output layout, so links do not point to split-only paths. A configured Understanding parser that cannot guarantee a single Markdown body returns an explicit unsupported-mode error.
 - To create or update plain text directly, use [content/write](03-filesystem.md#write) instead of `add_resource`. Semantic processing and embeddings are refreshed automatically after resource ingestion and content writes.
 
@@ -530,16 +531,13 @@ ov add-resource ./documents/guide.md -p viking://resources/docs/{calendar:today}
   "result": {
     "status": "success",
     "root_uri": "viking://resources/guide",
-    "temp_uri": "viking://temp/username/04291108_b62dc7/guide",
-    "source_path": "./documents/guide.md",
-    "meta": {},
-    "errors": [],
+    "source_path": "https://example.com/guide.md",
     "task_id": "uuid-xxx"
   }
 }
 ```
 
-Use the returned `task_id` to poll `/api/v1/tasks/{task_id}` for queue completion. For Git repository sources with `wait=false`, the same endpoint tracks the full background import and the completed task result contains the full import result, including `queue_status`.
+Use the returned `task_id` to poll `/api/v1/tasks/{task_id}` for full background import and queue completion. The completed task result contains the final import result, including `queue_status`.
 
 **CLI Response (Default Table Format)**
 
@@ -566,8 +564,8 @@ task_id      uuid-xxx
 | Field | Type | Description |
 |-------|------|-------------|
 | `status` | string | Processing status: "success" or "error" |
-| `root_uri` | string | Final URI of the resource in OpenViking |
-| `task_id` | string | (Optional, only when `wait=false`) Task ID for polling `/api/v1/tasks/{task_id}`. Non-Git imports use it for queue tracking; Git repository imports use it for full background import tracking. |
+| `root_uri` | string | Resource URI; for a non-waiting background import, the reserved target directory |
+| `task_id` | string | (Optional, only when `wait=false`) Task ID for polling `/api/v1/tasks/{task_id}` for source processing and subsequent queue work |
 | `temp_uri` | string | Temporary URI produced during import |
 | `source_path` | string | Original source file path or URL |
 | `meta` | object | Metadata from resource parsing (file type, size, etc.) |
@@ -575,7 +573,7 @@ task_id      uuid-xxx
 | `warnings` | array | (Optional) List of warnings (only when `strict=False`) |
 | `queue_status` | object | (Optional, only when `wait=true`) Queue processing status with `pending`, `processing`, `completed` counts |
 
-For Git repository sources with `wait=false`, the background task has `task_type="add_resource"` and `resource_id` equal to the returned `root_uri`. Running task records may include `stage`; completed task results include `queue_status` with the final semantic and embedding queue summary.
+Background source imports use `task_type="add_resource"` and `resource_id` equal to the returned `root_uri`. Running task records may include `stage`; completed task results include `queue_status` with the final semantic and embedding queue summary.
 
 ---
 

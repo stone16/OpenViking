@@ -460,6 +460,7 @@ class TestAddResourceArgs:
             path="https://example.feishu.cn/docx/doc_token",
             ctx=request_context,
             to=to_uri,
+            wait=True,
             watch_interval=30,
             args={
                 "feishu_access_token": " u-test ",

@@ -80,6 +80,8 @@ class ParserRouter:
         return ext in extensions
 
     def should_use_understanding_directly(self, source: str, **kwargs) -> bool:
+        if kwargs.get("parser_backend") == "internal":
+            return False
         forced = kwargs.get("parser_backend") == "understanding"
         return bool(
             (forced or self.should_use_understanding_api(source))

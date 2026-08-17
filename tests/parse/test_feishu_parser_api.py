@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from openviking.parse.accessors.base import LocalResource, SourceType
+from openviking.parse.accessors.staged_resource import StagedResource
 from openviking.parse.understanding_api import PREPARED_RESPONSE_ID_ARG, UnderstandingAPI
 from openviking.server.identity import RequestContext, Role
 from openviking.service.resource_service import ResourceService
@@ -392,9 +393,17 @@ def test_add_resource_message_round_trips_internal_fields():
 
 
 def test_add_resource_message_round_trips_processing_mode():
+    staged_source = {
+        "temp_uri": "viking://temp/user-1/task-1",
+        "source_uri": "viking://temp/user-1/task-1/source/demo.md",
+        "source_type": "local",
+        "original_source": "/tmp/demo.md",
+        "is_directory": False,
+        "meta": {"resolved_extension": ".md"},
+    }
     msg = AddResourceMsg(
         task_id="task-1",
-        path="https://example.com/demo.md",
+        staged_source=staged_source,
         root_uri="viking://resources/demo",
         account_id="account-1",
         user_id="user-1",
@@ -405,25 +414,17 @@ def test_add_resource_message_round_trips_processing_mode():
     restored = AddResourceMsg.from_dict(msg.to_dict())
 
     assert restored.processing_mode == "vectors_only"
+    assert restored.staged_source == staged_source
 
 
 @pytest.mark.asyncio
 async def test_uat_producer_payload_reaches_worker_without_persisting_token(monkeypatch):
     source = "https://example.larkoffice.com/docx/doxcnToken"
     root_uri = "viking://resources/lark/doxcnToken"
-    submit_understanding = AsyncMock(return_value="response-1")
     resource_processor = SimpleNamespace(
-        should_use_understanding_directly=lambda _source, **_kwargs: True,
-        submit_understanding=submit_understanding,
-        tree_builder=SimpleNamespace(
-            resolve_target_uri=AsyncMock(return_value=(root_uri, root_uri))
-        ),
-        process_resource=AsyncMock(
-            return_value={
-                "status": "success",
-                "root_uri": "viking://resources/lark/真实文档标题",
-            }
-        ),
+        should_use_understanding_directly=lambda _source, **_kwargs: False,
+        async_route_requires_preparation=lambda _source, **_kwargs: False,
+        process_resource=AsyncMock(),
     )
     task_tracker = SimpleNamespace(
         create=AsyncMock(return_value=SimpleNamespace(task_id="task-1")),
@@ -457,6 +458,7 @@ async def test_uat_producer_payload_reaches_worker_without_persisting_token(monk
         Mock(return_value=False),
     )
     monkeypatch.setattr("openviking.service.resource_service.uuid4", Mock(return_value="task-1"))
+    service._plan_resource_target = AsyncMock(return_value=(root_uri, None))
     ctx = RequestContext(
         user=UserIdentifier("account-1", "user-1"),
         role=Role.USER,
@@ -471,21 +473,23 @@ async def test_uat_producer_payload_reaches_worker_without_persisting_token(monk
         args={"feishu_access_token": "u-secret", "custom_option": "forwarded"},
     )
 
-    assert initial_result == {"status": "success", "task_id": "task-1"}
-    assert task_tracker.create.await_args.kwargs["resource_id"] is None
-    submit_understanding.assert_awaited_once_with(
-        source,
-        feishu_access_token="u-secret",
-        custom_option="forwarded",
-    )
+    assert initial_result == {
+        "status": "success",
+        "root_uri": root_uri,
+        "source_path": source,
+        "task_id": "task-1",
+    }
+    assert task_tracker.create.await_args.kwargs["private_input"] == {
+        "feishu_access_token": "u-secret"
+    }
     payload = queue_manager.enqueue.await_args.args[1]
-    assert queue_manager.enqueue.await_args.args[0] == QueueManager.EXTERNAL_PARSE
+    assert queue_manager.enqueue.await_args.args[0] == QueueManager.ADD_RESOURCE
     assert "u-secret" not in json.dumps(payload)
-    assert payload["understanding_response_id"] == "response-1"
     assert payload["args"] == {
         "custom_option": "forwarded",
-        "parser_backend": "understanding",
+        "parser_backend": "internal",
     }
+    resource_processor.process_resource.assert_not_awaited()
 
     queued_msg = AddResourceMsg.from_dict(payload)
     service._execute_resource_ingestion = AsyncMock(
@@ -499,32 +503,44 @@ async def test_uat_producer_payload_reaches_worker_without_persisting_token(monk
         ctx=ctx,
         resource_lock=None,
         stage_callback=AsyncMock(),
+        private_input={"feishu_access_token": "u-secret"},
     )
 
     call = service._execute_resource_ingestion.await_args
-    assert call.kwargs[PREPARED_RESPONSE_ID_ARG] == "response-1"
     assert call.kwargs["custom_option"] == "forwarded"
-    assert call.kwargs["parser_backend"] == "understanding"
+    assert call.kwargs["feishu_access_token"] == "u-secret"
+    assert call.kwargs["parser_backend"] == "internal"
 
 
 @pytest.mark.asyncio
-async def test_local_prepared_job_uses_add_resource_queue(monkeypatch):
+async def test_local_prepared_job_uses_add_resource_queue(monkeypatch, tmp_path):
     root_uri = "viking://resources/script"
     resource_lock = {"lease_ref": "lock-1"}
+    source = tmp_path / "script.md"
+    source.write_text("hello", encoding="utf-8")
+    prepared = LocalResource(
+        path=source,
+        source_type=SourceType.LOCAL,
+        original_source=str(source),
+        meta={"resolved_extension": ".md", "resolved_name": "script.md"},
+        is_temporary=False,
+    )
+    staged = StagedResource(
+        temp_uri="viking://temp/account-1/task-1",
+        source_uri="viking://temp/account-1/task-1/source/script.md",
+        source_type=SourceType.LOCAL,
+        original_source=str(source),
+        is_directory=False,
+        meta={"resolved_extension": ".md", "resolved_name": "script.md"},
+    )
     agfs = SimpleNamespace(
         pathlock_to_handoff=AsyncMock(return_value={"handle_id": "lock-1"}),
         pathlock_handoff=AsyncMock(),
         pathlock_release=AsyncMock(),
     )
     resource_processor = SimpleNamespace(
-        process_resource=AsyncMock(
-            return_value={
-                "status": "success",
-                "root_uri": root_uri,
-                "_post_process": {"root_uri": root_uri},
-                "_resource_lock": resource_lock,
-            }
-        )
+        prepare_resource=AsyncMock(return_value=prepared),
+        process_resource=AsyncMock(),
     )
 
     service = ResourceService(
@@ -532,7 +548,10 @@ async def test_local_prepared_job_uses_add_resource_queue(monkeypatch):
         resource_processor=resource_processor,
         skill_processor=SimpleNamespace(),
     )
+    service._plan_resource_target = AsyncMock(return_value=(root_uri, resource_lock))
     service._enqueue_add_resource_job = AsyncMock(return_value=SimpleNamespace(task_id="task-1"))
+    stage = AsyncMock(return_value=staged)
+    monkeypatch.setattr("openviking.parse.accessors.staged_resource.stage_resource", stage)
     monkeypatch.setattr(
         service,
         "_connector_delegate",
@@ -548,7 +567,7 @@ async def test_local_prepared_job_uses_add_resource_queue(monkeypatch):
     )
 
     result = await service.add_resource(
-        path="/tmp/script.md",
+        path=str(source),
         ctx=ctx,
         to=root_uri,
         wait=False,
@@ -557,8 +576,15 @@ async def test_local_prepared_job_uses_add_resource_queue(monkeypatch):
     assert result["task_id"] == "task-1"
     call = service._enqueue_add_resource_job.await_args
     assert call.kwargs["queue_name"] == QueueManager.ADD_RESOURCE
-    assert call.args[0].prepared == {"root_uri": root_uri}
+    assert call.args[0].prepared is None
+    assert call.args[0].staged_source == staged.to_dict()
+    assert call.args[0].root_uri == root_uri
+    assert call.args[0].args == {
+        "parser_backend": "internal",
+        "resolved_extension": ".md",
+    }
     assert call.args[0].lock_handoff == {"handle_id": "lock-1"}
+    resource_processor.process_resource.assert_not_awaited()
     agfs.pathlock_to_handoff.assert_awaited_once_with(resource_lock)
 
 
@@ -646,13 +672,18 @@ async def test_uat_producer_cancellation_respects_queue_ownership(
         )
 
     release.assert_awaited_once_with(lock_lease)
-    task_tracker.create.assert_not_awaited()
-    task_tracker.fail.assert_not_awaited()
     if cancel_stage == "submit":
+        task_tracker.create.assert_not_awaited()
+        task_tracker.fail.assert_not_awaited()
         enqueue.assert_not_awaited()
     else:
+        task_tracker.create.assert_awaited_once()
         enqueue.assert_awaited_once()
         assert enqueue.await_args.args[0] == QueueManager.EXTERNAL_PARSE
+        if cancel_stage == "enqueue":
+            task_tracker.fail.assert_awaited_once()
+        else:
+            task_tracker.fail.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -798,6 +829,7 @@ async def test_add_resource_processor_persists_final_resource_uri(monkeypatch):
         update_stage=AsyncMock(),
         complete=AsyncMock(),
         fail=AsyncMock(),
+        get_private_input=AsyncMock(return_value={}),
         wait_for_descendants=AsyncMock(),
     )
     monkeypatch.setattr(

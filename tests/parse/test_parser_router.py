@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from openviking.parse.accessors.base import LocalResource, SourceType
+from openviking.parse.accessors.feishu_accessor import FeishuAccessor
 from openviking.parse.parser_router import ParserRouter
 from openviking.parse.parsers.media.utils import MPEG_TS_PACKET_SIZE, MPEG_TS_PROBE_BYTES
 from openviking.parse.registry import ParserRegistry
@@ -198,6 +199,11 @@ def test_should_use_understanding_api_for_feishu_url(monkeypatch):
         "https://example.larkoffice.com/wiki/wikicnToken",
         feishu_access_token="u-test",
     )
+    assert not router.should_use_understanding_directly(
+        "https://example.larkoffice.com/wiki/wikicnToken",
+        feishu_access_token="u-test",
+        parser_backend="internal",
+    )
     assert not router.should_use_understanding_api(
         "https://larkoffice.com.evil.example/wiki/wikicnToken"
     )
@@ -272,8 +278,12 @@ async def test_normalized_feishu_markdown_stays_internal(monkeypatch, tmp_path):
     router._understanding_api = understanding
     processor = UnifiedResourceProcessor()
     processor._parser_router = router
+    processor._accessor_registry = SimpleNamespace(
+        get_accessor=lambda _source, **_kwargs: FeishuAccessor()
+    )
 
     assert not processor.should_use_understanding_api(resource)
+    assert not processor.async_route_requires_preparation(resource.original_source)
     await router.parse(
         resource,
         resolved_extension=".md",
